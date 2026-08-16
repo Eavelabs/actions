@@ -1,7 +1,7 @@
 # 通用 Release 创建 action
 #
 # 从调用方仓库的 CHANGELOG.md 提取版本对应内容（多级 fallback），并调用
-# softprops/action-gh-release@v1 创建 GitHub Release。
+# softprops/action-gh-release@v2 创建 GitHub Release。
 #
 # 用法（在调用方 workflow 中）：
 #   - name: 🚀 Create Release
@@ -18,8 +18,9 @@ description: 'Extract release notes from CHANGELOG.md and create a GitHub Releas
 
 inputs:
   version:
-    description: 'Release version (e.g. 0.0.1b5 or 1.0.0)'
-    required: true
+    description: 'Release version (e.g. 0.0.1b5 or 1.0.0). Optional if derive_version_from_ref=true.'
+    required: false
+    default: ''
   tag_prefix:
     description: 'Tag prefix'
     required: false
@@ -44,6 +45,18 @@ inputs:
     description: 'Path to CHANGELOG.md (relative to caller repo root)'
     required: false
     default: 'CHANGELOG.md'
+  changelog_globs:
+    description: 'Comma/newline-separated candidate changelog paths. The first one that exists is used (overrides changelog_path). e.g. "docs/CHANGELOG.md,CHANGELOG.md"'
+    required: false
+    default: ''
+  derive_version_from_ref:
+    description: 'When true and version is empty, derive version from GITHUB_REF (e.g. refs/tags/v1.2.3 -> 1.2.3)'
+    required: false
+    default: 'false'
+  release_type:
+    description: 'Convenience preset: stable | preview | beta | rc | alpha | draft. Maps to prerelease/draft. Explicit prerelease/draft inputs take precedence.'
+    required: false
+    default: ''
   extra_body:
     description: 'Extra Markdown appended after the changelog section'
     required: false
@@ -56,101 +69,63 @@ inputs:
     description: 'Files to attach to the release (e.g. dist/*), newline-separated'
     required: false
     default: ''
+  generate_release_notes:
+    description: 'Append GitHub auto-generated release notes (from commits) to the changelog body'
+    required: false
+    default: 'false'
+  target_commitish:
+    description: 'Commitish value that determines where the Git tag is created from'
+    required: false
+    default: ''
+  discussion_category_name:
+    description: 'Category name of an existing discussion to create the release in'
+    required: false
+    default: ''
+  fail_on_unmatched_files:
+    description: 'Fail if any file in `files` matches no asset'
+    required: false
+    default: 'false'
+  replace_assets:
+    description: 'Remove existing assets of the same name before uploading new ones'
+    required: false
+    default: 'false'
 
 outputs:
   version:
-    description: 'Version used'
-    value: ${{ inputs.version }}
+    description: 'Version used (normalized, without tag prefix)'
+    value: ${{ steps.meta.outputs.version }}
   tag:
     description: 'Git tag created'
-    value: ${{ inputs.tag_prefix }}${{ inputs.version }}
+    value: ${{ steps.meta.outputs.tag }}
+  title:
+    description: 'Release title'
+    value: ${{ steps.meta.outputs.title }}
   changes:
     description: 'Extracted changelog content'
-    value: ${{ steps.changelog.outputs.changes }}
+    value: ${{ steps.meta.outputs.changes }}
 
 runs:
   using: composite
   steps:
-    - name: 📝 Extract changelog (multi-level fallback)
-      id: changelog
-      shell: bash
-      run: |
-        VERSION="${{ inputs.version }}"
-        CHANGELOG="${{ inputs.changelog_path }}"
-
-        # 提取从 `## [SECTION]`（可带 ` - 日期` 后缀）到下一个 `## [` 之间的内容。
-        # 用 awk 的 index() 做"字符串匹配"（非正则），避免版本号中的 `[` `]` `.`
-        # 被当作正则元字符。
-        extract() {
-          awk -v sec="$1" 'BEGIN{found=0; buf=""; pfx="## [" sec "]"}
-            /^## \[/ {
-              if (found) exit
-              if (index($0, pfx) == 1) {
-                r = substr($0, length(pfx)+1, 1)
-                if (r == "" || r == " ") found=1
-              }
-              next
-            }
-            found { buf = buf $0 "\n" }
-            END { printf "%s", buf }' "$CHANGELOG"
-        }
-        # 判断内容是否含"有效变更"：排除说明(>)、标题(#)、分隔线(---)、空行、占位符
-        has_content() {
-          echo "$1" | grep -v '^[[:space:]]*$' | grep -v '^#' | grep -v '^>' \
-            | grep -v '^---' | grep -v '（待补充）' | grep -q .
-        }
-
-        if [ -f "$CHANGELOG" ]; then
-          # 1) 精确版本号章节
-          CHANGES=$(extract "$VERSION")
-          # 2) [Unreleased]（若含有效变更）
-          if [ -z "$CHANGES" ]; then
-            UNREL=$(extract "Unreleased")
-            if has_content "$UNREL"; then CHANGES="$UNREL"; fi
-          fi
-          # 3) Unreleased 无有效变更 -> 下一个有实际内容的版本章节
-          if [ -z "$CHANGES" ]; then
-            for SEC in $(awk '/^## \[/ && $0 !~ /Unreleased/ {gsub(/^## \[/,""); gsub(/\].*$/,""); print}' "$CHANGELOG"); do
-              C=$(extract "$SEC")
-              if has_content "$C"; then CHANGES="$C"; break; fi
-            done
-          fi
-          # 4) 都没有则用默认文案（不报错）
-          if [ -z "$CHANGES" ]; then
-            CHANGES="${{ inputs.fallback_text }} $VERSION"
-          fi
-        else
-          CHANGES="${{ inputs.fallback_text }} $VERSION"
-        fi
-
-        echo "changes<<EOF" >> "$GITHUB_OUTPUT"
-        echo "$CHANGES" >> "$GITHUB_OUTPUT"
-        echo "EOF" >> "$GITHUB_OUTPUT"
-
-    - name: 🔧 Normalize version & compose release title
+    # 核心逻辑全部收敛在独立脚本 entrypoint.sh，测试直接复用同一份逻辑，
+    # 避免 action.yml 与 tests/test.sh 各维护一份导致漂移。
+    - name: 📝 Extract changelog & compose meta
       id: meta
       shell: bash
       env:
-        RAW_VERSION: ${{ inputs.version }}
-        RAW_PREFIX: ${{ inputs.tag_prefix }}
-        REL_SUFFIX: ${{ inputs.release_name_suffix }}
-        REL_NAME: ${{ inputs.release_name }}
-      run: |
-        # 规范化版本：去掉可能误传的 'v'/'V' 前缀（如 "v1.0.0" / "V1.0.0" -> "1.0.0"），避免标题/tag 出现 vv / vV
-        VERSION="${RAW_VERSION}"
-        if [[ "${VERSION}" == [vV]* ]]; then VERSION="${VERSION:1}"; fi
-        # 前缀统一转为小写 v：最终 tag/标题始终是 "v<编号>" 的小写形式
-        PREFIX="$(printf '%s' "${RAW_PREFIX:-v}" | tr 'A-Z' 'a-z')"
-        if [ -z "${PREFIX}" ]; then PREFIX="v"; fi
-        if [ -n "${REL_NAME}" ]; then
-          TITLE="${REL_NAME} ${PREFIX}${VERSION}${REL_SUFFIX}"
-        else
-          TITLE="${PREFIX}${VERSION}${REL_SUFFIX}"
-        fi
-        TAG="${PREFIX}${VERSION}"
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-        echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_TAG_PREFIX: ${{ inputs.tag_prefix }}
+        INPUT_CHANGELOG_PATH: ${{ inputs.changelog_path }}
+        INPUT_CHANGELOG_GLOBS: ${{ inputs.changelog_globs }}
+        INPUT_DERIVE_VERSION_FROM_REF: ${{ inputs.derive_version_from_ref }}
+        INPUT_RELEASE_TYPE: ${{ inputs.release_type }}
+        INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        INPUT_DRAFT: ${{ inputs.draft }}
+        INPUT_FALLBACK_TEXT: ${{ inputs.fallback_text }}
+        INPUT_RELEASE_NAME: ${{ inputs.release_name }}
+        INPUT_RELEASE_NAME_SUFFIX: ${{ inputs.release_name_suffix }}
+        GITHUB_REF: ${{ github.ref }}
+      run: bash "${GITHUB_ACTION_PATH}/entrypoint.sh"
 
     - name: 🚀 Create GitHub Release
       uses: softprops/action-gh-release@v2
@@ -158,8 +133,13 @@ runs:
         tag_name: ${{ steps.meta.outputs.tag }}
         name: ${{ steps.meta.outputs.title }}
         body: |
-          ${{ steps.changelog.outputs.changes }}
+          ${{ steps.meta.outputs.changes }}
           ${{ inputs.extra_body }}
         files: ${{ inputs.files }}
-        prerelease: ${{ inputs.prerelease }}
-        draft: ${{ inputs.draft }}
+        prerelease: ${{ steps.meta.outputs.prerelease }}
+        draft: ${{ steps.meta.outputs.draft }}
+        generate_release_notes: ${{ inputs.generate_release_notes }}
+        target_commitish: ${{ inputs.target_commitish }}
+        discussion_category_name: ${{ inputs.discussion_category_name }}
+        fail_on_unmatched_files: ${{ inputs.fail_on_unmatched_files }}
+        replace_assets: ${{ inputs.replace_assets }}
