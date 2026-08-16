@@ -1,0 +1,39 @@
+name: Release
+
+# 用本仓库自己的 release-notes action 给自己发 GitHub Release。
+#
+# 注意：首次发布时还没有 tag，因此用本地相对路径 ./release-notes 自引用；
+# 发布成功后，外部调用方即可改用 Eavelabs/actions/release-notes@v1。
+#
+# 用法：在 GitHub 页面 Actions -> Release -> Run workflow 填入 version 手动触发。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.0.0）'
+        required: true
+      prerelease:
+        description: '是否预发布（true/false）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 🚀 Create Release
+        uses: ./release-notes
+        with:
+          version: ${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          release_name: "Eavelabs actions"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

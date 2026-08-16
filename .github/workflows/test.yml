@@ -1,0 +1,16 @@
+name: Test Actions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test all actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run release-notes tests
+        run: bash release-notes/tests/test.sh
